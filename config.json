@@ -4,5 +4,7 @@
   "Password": "YourPassword123",
   "AuthenticationType": "Basic",
   "CheckLastHours": 24,
-  "CameraGuid": "79fc9949-757b-46d3-afb1-8d3c62c03faa"
+  "CameraGuids": [
+    "79fc9949-757b-46d3-afb1-8d3c62c03faa"
+  ]
 }

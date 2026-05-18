@@ -17,13 +17,16 @@ Chỉnh file `config.json` trước khi chạy:
   "Username": "admin",
   "Password": "your_password",
   "AuthenticationType": "Basic",
-  "CameraGuid": "79fc9949-757b-46d3-afb1-8d3c62c03faa",
+  "CameraGuids": [
+    "79fc9949-757b-46d3-afb1-8d3c62c03faa",
+    "00867a47-46e2-45e1-9999-3170de1de0b8"
+  ],
 
   "CheckLastHours": 24
 }
 ```
 
-- **CameraGuid**: GUID của camera cần kiểm tra (lấy từ Milestone Management Client)
+- **CameraGuids**: danh sách GUID camera cần kiểm tra
 - **CheckLastHours**: số giờ tính từ thời điểm hiện tại về trước (dùng khi không truyền `--start-time`/`--end-time`)
 
 ## Chạy
