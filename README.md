@@ -19,22 +19,36 @@ Chỉnh file `config.json` trước khi chạy:
   "AuthenticationType": "Basic",
   "CameraGuid": "79fc9949-757b-46d3-afb1-8d3c62c03faa",
 
-  "CheckLastHours": 24,
-
-  "StartTime": "2026-05-16 00:00:00",
-  "EndTime":   "2026-05-18 00:00:00"
+  "CheckLastHours": 24
 }
 ```
 
 - **CameraGuid**: GUID của camera cần kiểm tra (lấy từ Milestone Management Client)
-- **StartTime / EndTime**: quét theo khoảng thời gian cố định. Nếu để trống thì dùng `CheckLastHours`
-- **CheckLastHours**: số giờ tính từ thời điểm hiện tại về trước (dùng khi không có StartTime/EndTime)
+- **CheckLastHours**: số giờ tính từ thời điểm hiện tại về trước (dùng khi không truyền `--start-time`/`--end-time`)
 
 ## Chạy
+
+Kiểm tra gap theo `CheckLastHours` trong `config.json`:
 
 ```
 MilestoneGapChecker.exe
 ```
+
+Kiểm tra gap theo mốc thời gian truyền trực tiếp:
+
+```
+MilestoneGapChecker.exe --start-time "2026-05-16 00:00:00" --end-time "2026-05-18 00:00:00"
+```
+
+Liệt kê toàn bộ camera kèm GUID:
+
+```
+MilestoneGapChecker.exe --list-cameras
+```
+
+(Hoặc dùng viết tắt: `-l`)
+
+Lưu ý: nếu dùng `--start-time` hoặc `--end-time` thì phải truyền đủ cả hai.
 
 ## Output mẫu
 

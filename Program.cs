@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Text.Json;
+using Newtonsoft.Json;
 using VideoOS.Platform;
 using VideoOS.Platform.Data;
 
@@ -17,9 +17,7 @@ namespace MilestoneGapChecker
         public string AuthenticationType { get; set; } = "Basic";
         public int CheckLastHours { get; set; } = 24;
         public string CameraGuid { get; set; }
-        // Nếu có StartTime và EndTime thì ưu tiên dùng, bỏ qua CheckLastHours
-        public string StartTime { get; set; }
-        public string EndTime { get; set; }
+        // Nếu không truyền --start-time/--end-time thì dùng CheckLastHours
     }
 
     class Program
@@ -30,7 +28,7 @@ namespace MilestoneGapChecker
             VideoOS.Platform.SDK.Export.Environment.Initialize();
             Console.OutputEncoding = System.Text.Encoding.UTF8;
 
-            Console.WriteLine("=== MILESTONE GAP CHECKER (CONFIG MODE) ===");
+            Console.WriteLine("=== MILESTONE GAP CHECKER ===");
 
             // 1. Đọc file config.json
             AppConfig config = LoadConfiguration();
@@ -50,6 +48,16 @@ namespace MilestoneGapChecker
                 VideoOS.Platform.SDK.Environment.Login(uri, false);
                 Console.WriteLine("Đăng nhập thành công!");
 
+                bool listAllCameras = args.Any(a =>
+                    string.Equals(a, "--list-cameras", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(a, "-l", StringComparison.OrdinalIgnoreCase));
+
+                if (listAllCameras)
+                {
+                    ListAllCameras();
+                    return;
+                }
+
                 // 3. Lấy camera theo GUID
                 if (string.IsNullOrEmpty(config.CameraGuid))
                 {
@@ -66,15 +74,24 @@ namespace MilestoneGapChecker
                 }
 
                 // 4. Xác định khoảng thời gian quét
+                string startArg = GetArgValue(args, "--start-time");
+                string endArg = GetArgValue(args, "--end-time");
                 DateTime startTime, endTime;
-                if (!string.IsNullOrEmpty(config.StartTime) && !string.IsNullOrEmpty(config.EndTime))
+
+                if (!string.IsNullOrWhiteSpace(startArg) || !string.IsNullOrWhiteSpace(endArg))
                 {
-                    if (!DateTime.TryParse(config.StartTime, out startTime) ||
-                        !DateTime.TryParse(config.EndTime, out endTime))
+                    if (string.IsNullOrWhiteSpace(startArg) || string.IsNullOrWhiteSpace(endArg))
                     {
-                        Console.WriteLine("LỖI: StartTime/EndTime không đúng định dạng. Dùng: yyyy-MM-dd HH:mm:ss");
+                        Console.WriteLine("LỖI: Phải truyền đủ cả --start-time và --end-time.");
                         return;
                     }
+
+                    if (!DateTime.TryParse(startArg, out startTime) || !DateTime.TryParse(endArg, out endTime))
+                    {
+                        Console.WriteLine("LỖI: --start-time/--end-time không đúng định dạng. Dùng: yyyy-MM-dd HH:mm:ss");
+                        return;
+                    }
+
                     Console.WriteLine($"Bắt đầu quét camera: {cam.Name} (Từ {startTime:dd/MM/yyyy HH:mm} đến {endTime:dd/MM/yyyy HH:mm})...");
                 }
                 else
@@ -97,6 +114,16 @@ namespace MilestoneGapChecker
             }
         }
 
+        static string GetArgValue(string[] args, string key)
+        {
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (string.Equals(args[i], key, StringComparison.OrdinalIgnoreCase))
+                    return args[i + 1];
+            }
+            return null;
+        }
+
         static AppConfig LoadConfiguration()
         {
             string configPath = "config.json";
@@ -109,12 +136,47 @@ namespace MilestoneGapChecker
             try
             {
                 string jsonString = File.ReadAllText(configPath);
-                return JsonSerializer.Deserialize<AppConfig>(jsonString);
+                return JsonConvert.DeserializeObject<AppConfig>(jsonString);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"LỖI: Không thể đọc file cấu hình. Chi tiết: {ex.Message}");
                 return null;
+            }
+        }
+
+        static void ListAllCameras()
+        {
+            var rootItems = Configuration.Instance.GetItems();
+            var allCameras = rootItems
+                .SelectMany(GetCamerasRecursively)
+                .Where(c => c != null)
+                .GroupBy(c => c.FQID.ObjectId)
+                .Select(g => g.First())
+                .OrderBy(c => c.Name)
+                .ToList();
+
+            Console.WriteLine($"Tìm thấy {allCameras.Count} camera:");
+            foreach (var camera in allCameras)
+                Console.WriteLine($"- {camera.Name} | GUID: {camera.FQID.ObjectId}");
+        }
+
+        static System.Collections.Generic.IEnumerable<Item> GetCamerasRecursively(Item item)
+        {
+            if (item == null)
+                yield break;
+
+            if (item.FQID.Kind == Kind.Camera)
+                yield return item;
+
+            var children = item.GetChildren();
+            if (children == null)
+                yield break;
+
+            foreach (var child in children)
+            {
+                foreach (var camera in GetCamerasRecursively(child))
+                    yield return camera;
             }
         }
 
