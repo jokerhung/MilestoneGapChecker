@@ -1,14 +1,17 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Web.Http;
+using Microsoft.Owin.Hosting;
 using Newtonsoft.Json;
+using Owin;
 using VideoOS.Platform;
 using VideoOS.Platform.Data;
 
 namespace MilestoneGapChecker
 {
-    // Model để map dữ liệu từ config.json
     public class AppConfig
     {
         public string ServerUrl { get; set; }
@@ -17,7 +20,6 @@ namespace MilestoneGapChecker
         public string AuthenticationType { get; set; } = "Basic";
         public int CheckLastHours { get; set; } = 24;
         public string[] CameraGuids { get; set; }
-        // Nếu không truyền --start-time/--end-time thì dùng CheckLastHours
     }
 
     public class GapRange
@@ -30,7 +32,97 @@ namespace MilestoneGapChecker
     {
         public string CameraName { get; set; }
         public Guid CameraGuid { get; set; }
-        public System.Collections.Generic.List<GapRange> Gaps { get; set; } = new System.Collections.Generic.List<GapRange>();
+        public List<GapRange> Gaps { get; set; } = new List<GapRange>();
+    }
+
+    public class GapCheckResponse
+    {
+        public string Status { get; set; }
+        public string Message { get; set; }
+        public bool HasGap { get; set; }
+        public List<CameraGapSummary> Cameras { get; set; }
+    }
+
+    public class GapRunResult
+    {
+        public bool Success { get; set; }
+        public string ErrorMessage { get; set; }
+        public List<CameraGapSummary> Summaries { get; set; } = new List<CameraGapSummary>();
+    }
+
+    public class ResolveCamerasResult
+    {
+        public bool Success { get; set; }
+        public string ErrorMessage { get; set; }
+        public List<Item> Cameras { get; set; } = new List<Item>();
+    }
+
+    public class ResolveTimeResult
+    {
+        public bool Success { get; set; }
+        public string ErrorMessage { get; set; }
+        public DateTime StartTime { get; set; }
+        public DateTime EndTime { get; set; }
+    }
+
+    public static class AppState
+    {
+        public static AppConfig Config { get; set; }
+        public static Uri ServerUri { get; set; }
+        public static CredentialCache Credentials { get; set; }
+    }
+
+    public class Startup
+    {
+        public void Configuration(IAppBuilder app)
+        {
+            var config = new HttpConfiguration();
+            config.MapHttpAttributeRoutes();
+            config.Routes.MapHttpRoute(
+                name: "DefaultApi",
+                routeTemplate: "api/{controller}/{action}",
+                defaults: new { action = RouteParameter.Optional }
+            );
+            app.UseWebApi(config);
+        }
+    }
+
+    [RoutePrefix("api")]
+    public class GapController : ApiController
+    {
+        [HttpGet]
+        [Route("health")]
+        public IHttpActionResult Health() => Ok(new { message = "ok" });
+
+        [AcceptVerbs("GET")]
+        [Route("gaps/check")]
+        public IHttpActionResult CheckGet([FromUri] string cameraGuids = null, [FromUri] string startTime = null, [FromUri] string endTime = null)
+        {
+            var guidList = string.IsNullOrWhiteSpace(cameraGuids)
+                ? null
+                : cameraGuids.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).ToArray();
+
+            var run = Program.RunGapCheck(guidList, startTime, endTime, false);
+            if (!run.Success)
+            {
+                return Content(HttpStatusCode.InternalServerError, new GapCheckResponse
+                {
+                    Status = "error",
+                    Message = run.ErrorMessage,
+                    HasGap = false,
+                    Cameras = new List<CameraGapSummary>()
+                });
+            }
+
+            var hasGap = run.Summaries.Any(s => s.Gaps.Any());
+            return Ok(new GapCheckResponse
+            {
+                Status = hasGap ? "error" : "success",
+                Message = hasGap ? "Có gap" : "Không có gap",
+                HasGap = hasGap,
+                Cameras = run.Summaries
+            });
+        }
     }
 
     class Program
@@ -40,113 +132,38 @@ namespace MilestoneGapChecker
             VideoOS.Platform.SDK.Environment.Initialize();
             VideoOS.Platform.SDK.Export.Environment.Initialize();
             Console.OutputEncoding = System.Text.Encoding.UTF8;
-
             Console.WriteLine("=== MILESTONE GAP CHECKER ===");
 
-            // 1. Đọc file config.json
-            AppConfig config = LoadConfiguration();
-            if (config == null) return;
+            var appConfig = LoadConfiguration();
+            if (appConfig == null) return;
+            AppState.Config = appConfig;
 
             try
             {
-                // 2. Thiết lập đăng nhập
-                Uri uri = new Uri(config.ServerUrl);
-                // SDK 26.x: GetCredentialCache đã đổi thành Util.BuildCredentialCache
-                CredentialCache cc = VideoOS.Platform.Login.Util.BuildCredentialCache(
-                    uri, config.Username, config.Password, config.AuthenticationType);
-
-                Console.WriteLine($"Đang kết nối tới: {config.ServerUrl}...");
-                // SDK 26.x: AddServer và Login yêu cầu thêm tham số masterOnly
-                VideoOS.Platform.SDK.Environment.AddServer(uri, cc, false);
-                VideoOS.Platform.SDK.Environment.Login(uri, false);
+                Console.WriteLine($"Đang kết nối tới: {appConfig.ServerUrl}...");
+                LoginToMilestone(appConfig);
                 Console.WriteLine("Đăng nhập thành công!");
 
-                bool listAllCameras = args.Any(a =>
-                    string.Equals(a, "--list-cameras", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(a, "-l", StringComparison.OrdinalIgnoreCase));
+                if (args.Any(a => string.Equals(a, "--start-server", StringComparison.OrdinalIgnoreCase)))
+                {
+                    StartServer(args);
+                    return;
+                }
 
-                if (listAllCameras)
+                if (args.Any(a => string.Equals(a, "--list-cameras", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "-l", StringComparison.OrdinalIgnoreCase)))
                 {
                     ListAllCameras();
                     return;
                 }
 
-                // 3. Lấy danh sách camera theo GUID
-                if (config.CameraGuids == null || config.CameraGuids.Length == 0)
+                var run = RunGapCheck(null, GetArgValue(args, "--start-time"), GetArgValue(args, "--end-time"), true);
+                if (!run.Success)
                 {
-                    Console.WriteLine("LỖI: Chưa cấu hình CameraGuids trong config.json.");
+                    Console.WriteLine($"LỖI: {run.ErrorMessage}");
                     return;
                 }
 
-                var cameras = config.CameraGuids
-                    .Where(g => !string.IsNullOrWhiteSpace(g))
-                    .Select(g => g.Trim())
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Select(g => new { RawGuid = g, Parsed = Guid.TryParse(g, out var id), Id = Guid.TryParse(g, out var id2) ? id2 : Guid.Empty })
-                    .ToList();
-
-                var invalidGuids = cameras.Where(x => !x.Parsed).Select(x => x.RawGuid).ToList();
-                if (invalidGuids.Any())
-                {
-                    Console.WriteLine("LỖI: Các GUID không hợp lệ trong CameraGuids:");
-                    foreach (var bad in invalidGuids)
-                        Console.WriteLine($"- {bad}");
-                    return;
-                }
-
-                var cameraItems = cameras
-                    .Select(x => Configuration.Instance.GetItem(x.Id, Kind.Camera))
-                    .ToList();
-
-                var missing = cameraItems
-                    .Select((item, index) => new { item, guid = cameras[index].RawGuid })
-                    .Where(x => x.item == null)
-                    .Select(x => x.guid)
-                    .ToList();
-
-                if (missing.Any())
-                {
-                    Console.WriteLine("LỖI: Không tìm thấy camera với các GUID:");
-                    foreach (var guid in missing)
-                        Console.WriteLine($"- {guid}");
-                    return;
-                }
-
-                // 4. Xác định khoảng thời gian quét
-                string startArg = GetArgValue(args, "--start-time");
-                string endArg = GetArgValue(args, "--end-time");
-                DateTime startTime, endTime;
-
-                if (!string.IsNullOrWhiteSpace(startArg) || !string.IsNullOrWhiteSpace(endArg))
-                {
-                    if (string.IsNullOrWhiteSpace(startArg) || string.IsNullOrWhiteSpace(endArg))
-                    {
-                        Console.WriteLine("LỖI: Phải truyền đủ cả --start-time và --end-time.");
-                        return;
-                    }
-
-                    if (!DateTime.TryParse(startArg, out startTime) || !DateTime.TryParse(endArg, out endTime))
-                    {
-                        Console.WriteLine("LỖI: --start-time/--end-time không đúng định dạng. Dùng: yyyy-MM-dd HH:mm:ss");
-                        return;
-                    }
-
-                    Console.WriteLine($"Bắt đầu quét {cameraItems.Count} camera (Từ {startTime:dd/MM/yyyy HH:mm} đến {endTime:dd/MM/yyyy HH:mm})...");
-                }
-                else
-                {
-                    endTime = DateTime.Now;
-                    startTime = endTime.AddHours(-config.CheckLastHours);
-                    Console.WriteLine($"Bắt đầu quét {cameraItems.Count} camera (Dữ liệu {config.CheckLastHours}h qua)...");
-                }
-
-                var summaries = new System.Collections.Generic.List<CameraGapSummary>();
-                foreach (var camera in cameraItems)
-                {
-                    summaries.Add(CheckVideoGaps(camera, startTime, endTime));
-                }
-
-                PrintOverallSummary(summaries);
+                PrintOverallSummary(run.Summaries);
             }
             catch (Exception ex)
             {
@@ -158,160 +175,201 @@ namespace MilestoneGapChecker
             }
         }
 
+        static void StartServer(string[] args)
+        {
+            var baseUrl = GetArgValue(args, "--base-url") ?? "http://localhost:8080";
+            using (WebApp.Start<Startup>(url: baseUrl))
+            {
+                Console.WriteLine($"REST API đang chạy tại: {baseUrl}");
+                Console.WriteLine($"GET  {baseUrl}/api/health");
+                Console.WriteLine($"GET  {baseUrl}/api/gaps/check?cameraGuids=<guid1,guid2>&startTime=yyyy-MM-dd HH:mm:ss&endTime=yyyy-MM-dd HH:mm:ss");
+                Console.WriteLine("(Bỏ qua query để dùng CameraGuids + CheckLastHours từ config.json)");
+                Console.WriteLine("Nhấn Enter để dừng server...");
+                Console.ReadLine();
+            }
+        }
+
+        public static GapRunResult RunGapCheck(IEnumerable<string> cameraGuidsOverride, string startArg, string endArg, bool verbose)
+        {
+            return RunGapCheckInternal(cameraGuidsOverride, startArg, endArg, verbose, true);
+        }
+
+        static GapRunResult RunGapCheckInternal(IEnumerable<string> cameraGuidsOverride, string startArg, string endArg, bool verbose, bool allowReloginRetry)
+        {
+            var cfg = AppState.Config;
+            try
+            {
+                var camResult = ResolveCameras(cameraGuidsOverride ?? cfg.CameraGuids);
+                if (!camResult.Success) return new GapRunResult { Success = false, ErrorMessage = camResult.ErrorMessage };
+
+                var timeResult = ResolveTimeRange(startArg, endArg, cfg.CheckLastHours);
+                if (!timeResult.Success) return new GapRunResult { Success = false, ErrorMessage = timeResult.ErrorMessage };
+
+                if (verbose)
+                    Console.WriteLine($"Bắt đầu quét {camResult.Cameras.Count} camera (Từ {timeResult.StartTime:dd/MM/yyyy HH:mm} đến {timeResult.EndTime:dd/MM/yyyy HH:mm})...");
+
+                var summaries = new List<CameraGapSummary>();
+                foreach (var camera in camResult.Cameras)
+                    summaries.Add(CheckVideoGaps(camera, timeResult.StartTime, timeResult.EndTime, verbose));
+
+                return new GapRunResult { Success = true, Summaries = summaries };
+            }
+            catch (Exception ex)
+            {
+                if (allowReloginRetry && IsSessionExpiredError(ex))
+                {
+                    if (verbose)
+                        Console.WriteLine("Phiên đăng nhập đã hết hạn, đang đăng nhập lại...");
+                    ReLoginToMilestone();
+                    return RunGapCheckInternal(cameraGuidsOverride, startArg, endArg, verbose, false);
+                }
+
+                return new GapRunResult { Success = false, ErrorMessage = ex.Message };
+            }
+        }
+
+        static bool IsSessionExpiredError(Exception ex)
+        {
+            var message = ex?.Message ?? string.Empty;
+            return message.IndexOf("token", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.IndexOf("session", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.IndexOf("expired", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.IndexOf("unauthorized", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.IndexOf("401", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static void LoginToMilestone(AppConfig appConfig)
+        {
+            var uri = new Uri(appConfig.ServerUrl);
+            var cc = VideoOS.Platform.Login.Util.BuildCredentialCache(uri, appConfig.Username, appConfig.Password, appConfig.AuthenticationType);
+            VideoOS.Platform.SDK.Environment.AddServer(uri, cc, false);
+            VideoOS.Platform.SDK.Environment.Login(uri, false);
+            AppState.ServerUri = uri;
+            AppState.Credentials = cc;
+        }
+
+        static void ReLoginToMilestone()
+        {
+            if (AppState.ServerUri == null || AppState.Credentials == null)
+                throw new InvalidOperationException("Không có thông tin đăng nhập để re-login.");
+
+            VideoOS.Platform.SDK.Environment.Login(AppState.ServerUri, false);
+        }
+
+        static ResolveCamerasResult ResolveCameras(IEnumerable<string> cameraGuids)
+        {
+            var list = (cameraGuids ?? Array.Empty<string>())
+                .Where(g => !string.IsNullOrWhiteSpace(g))
+                .Select(g => g.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (!list.Any()) return new ResolveCamerasResult { Success = false, ErrorMessage = "Chưa cấu hình CameraGuids hoặc request không có cameraGuids." };
+
+            var invalid = list.Where(g => !Guid.TryParse(g, out _)).ToList();
+            if (invalid.Any()) return new ResolveCamerasResult { Success = false, ErrorMessage = "GUID không hợp lệ: " + string.Join(", ", invalid) };
+
+            var items = list.Select(g => Configuration.Instance.GetItem(Guid.Parse(g), Kind.Camera)).ToList();
+            var missing = items.Select((item, i) => new { item, guid = list[i] }).Where(x => x.item == null).Select(x => x.guid).ToList();
+            if (missing.Any()) return new ResolveCamerasResult { Success = false, ErrorMessage = "Không tìm thấy camera với GUID: " + string.Join(", ", missing) };
+
+            return new ResolveCamerasResult { Success = true, Cameras = items };
+        }
+
+        static ResolveTimeResult ResolveTimeRange(string startArg, string endArg, int checkLastHours)
+        {
+            if (!string.IsNullOrWhiteSpace(startArg) || !string.IsNullOrWhiteSpace(endArg))
+            {
+                if (string.IsNullOrWhiteSpace(startArg) || string.IsNullOrWhiteSpace(endArg))
+                    return new ResolveTimeResult { Success = false, ErrorMessage = "Phải truyền đủ cả startTime và endTime." };
+
+                if (!DateTime.TryParse(startArg, out var startTime) || !DateTime.TryParse(endArg, out var endTime))
+                    return new ResolveTimeResult { Success = false, ErrorMessage = "startTime/endTime không đúng định dạng yyyy-MM-dd HH:mm:ss." };
+
+                return new ResolveTimeResult { Success = true, StartTime = startTime, EndTime = endTime };
+            }
+
+            var end = DateTime.Now;
+            return new ResolveTimeResult { Success = true, StartTime = end.AddHours(-checkLastHours), EndTime = end };
+        }
+
         static string GetArgValue(string[] args, string key)
         {
             for (int i = 0; i < args.Length - 1; i++)
-            {
-                if (string.Equals(args[i], key, StringComparison.OrdinalIgnoreCase))
-                    return args[i + 1];
-            }
+                if (string.Equals(args[i], key, StringComparison.OrdinalIgnoreCase)) return args[i + 1];
             return null;
         }
 
         static AppConfig LoadConfiguration()
         {
-            string configPath = "config.json";
-            if (!File.Exists(configPath))
-            {
-                Console.WriteLine("LỖI: Không tìm thấy file config.json!");
-                return null;
-            }
-
-            try
-            {
-                string jsonString = File.ReadAllText(configPath);
-                return JsonConvert.DeserializeObject<AppConfig>(jsonString);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"LỖI: Không thể đọc file cấu hình. Chi tiết: {ex.Message}");
-                return null;
-            }
+            if (!File.Exists("config.json")) return null;
+            return JsonConvert.DeserializeObject<AppConfig>(File.ReadAllText("config.json"));
         }
 
         static void ListAllCameras()
         {
-            var rootItems = Configuration.Instance.GetItems();
-            var allCameras = rootItems
-                .SelectMany(GetCamerasRecursively)
-                .Where(c => c != null)
-                .GroupBy(c => c.FQID.ObjectId)
-                .Select(g => g.First())
-                .OrderBy(c => c.Name)
-                .ToList();
-
+            var allCameras = Configuration.Instance.GetItems().SelectMany(GetCamerasRecursively).GroupBy(c => c.FQID.ObjectId).Select(g => g.First()).OrderBy(c => c.Name).ToList();
             Console.WriteLine($"Tìm thấy {allCameras.Count} camera:");
-            foreach (var camera in allCameras)
-                Console.WriteLine($"- {camera.Name} | GUID: {camera.FQID.ObjectId}");
+            foreach (var camera in allCameras) Console.WriteLine($"- {camera.Name} | GUID: {camera.FQID.ObjectId}");
         }
 
-        static System.Collections.Generic.IEnumerable<Item> GetCamerasRecursively(Item item)
+        static IEnumerable<Item> GetCamerasRecursively(Item item)
         {
-            if (item == null)
-                yield break;
-
-            if (item.FQID.Kind == Kind.Camera)
-                yield return item;
-
+            if (item == null) yield break;
+            if (item.FQID.Kind == Kind.Camera) yield return item;
             var children = item.GetChildren();
-            if (children == null)
-                yield break;
-
+            if (children == null) yield break;
             foreach (var child in children)
-            {
-                foreach (var camera in GetCamerasRecursively(child))
-                    yield return camera;
-            }
+                foreach (var cam in GetCamerasRecursively(child))
+                    yield return cam;
         }
 
-        static CameraGapSummary CheckVideoGaps(Item cameraItem, DateTime start, DateTime end)
+        static CameraGapSummary CheckVideoGaps(Item cameraItem, DateTime start, DateTime end, bool verbose)
         {
-            var summary = new CameraGapSummary
+            var summary = new CameraGapSummary { CameraName = cameraItem.Name, CameraGuid = cameraItem.FQID.ObjectId };
+            var startUtc = start.ToUniversalTime();
+            var endUtc = end.ToUniversalTime();
+            var span = endUtc - startUtc;
+            var source = new SequenceDataSource(cameraItem);
+            var rawData = source.GetData(startUtc, span, 10000, span, 10000, DataType.SequenceTypeGuids.RecordingSequence);
+            var sequences = rawData.OfType<SequenceData>().Select(sd => sd.EventSequence).Where(es => es != null && es.StartDateTime < endUtc && es.EndDateTime > startUtc).OrderBy(es => es.StartDateTime).ToList();
+
+            if (verbose)
             {
-                CameraName = cameraItem.Name,
-                CameraGuid = cameraItem.FQID.ObjectId
-            };
+                Console.WriteLine($"\nCamera: {cameraItem.Name}");
+                Console.WriteLine($"   Khoảng thời gian: {start:dd/MM/yyyy HH:mm:ss} -> {end:dd/MM/yyyy HH:mm:ss}");
+                Console.WriteLine($"   Tìm thấy {sequences.Count} đoạn recording.");
+            }
 
-            DateTime startUtc = start.ToUniversalTime();
-            DateTime endUtc = end.ToUniversalTime();
-            TimeSpan span = endUtc - startUtc;
-
-            SequenceDataSource source = new SequenceDataSource(cameraItem);
-
-            var supportedTypes = source.GetTypes();
-            Console.WriteLine($"   [DEBUG] Supported types: {string.Join(", ", supportedTypes.Select(t => t.Name + "=" + t.Id))}");
-
-            var recGuid = DataType.SequenceTypeGuids.RecordingSequence;
-            var rawData = source.GetData(startUtc, span, 10000, span, 10000, recGuid);
-
-            Console.WriteLine($"   [DEBUG] rawData count={rawData.Count}, types: {string.Join(", ", rawData.Select(o => o?.GetType().Name).Distinct())}");
-
-            var sequences = rawData
-                .OfType<SequenceData>()
-                .Select(sd => sd.EventSequence)
-                .Where(es => es != null && es.StartDateTime < endUtc && es.EndDateTime > startUtc)
-                .OrderBy(es => es.StartDateTime)
-                .ToList();
-
-            Console.WriteLine($"\nCamera: {cameraItem.Name}");
-            Console.WriteLine($"   Khoảng thời gian: {start:dd/MM/yyyy HH:mm:ss} -> {end:dd/MM/yyyy HH:mm:ss}");
-            Console.WriteLine($"   Tìm thấy {sequences.Count} đoạn recording.");
-
-            if (sequences.Count == 0)
+            if (!sequences.Any())
             {
                 summary.Gaps.Add(new GapRange { Start = start, End = end });
-                Console.WriteLine($"   [!] CẢNH BÁO: Không có dữ liệu recording nào trong khoảng thời gian này!");
                 return summary;
             }
 
-            foreach (var seq in sequences)
-                Console.WriteLine($"   [DEBUG] seg: Start={seq.StartDateTime.ToLocalTime():dd/MM HH:mm:ss} | End={seq.EndDateTime.ToLocalTime():dd/MM HH:mm:ss}");
-
-            Console.WriteLine($"   Recording đầu tiên: {sequences.First().StartDateTime.ToLocalTime():dd/MM HH:mm:ss}");
-            Console.WriteLine($"   Recording cuối:     {sequences.Last().EndDateTime.ToLocalTime():dd/MM HH:mm:ss}");
-
-            DateTime currentPointer = startUtc;
-
+            var currentPointer = startUtc;
             foreach (var seq in sequences)
             {
                 if ((seq.StartDateTime - currentPointer).TotalMinutes > 5)
-                {
-                    var gapStart = currentPointer.ToLocalTime();
-                    var gapEnd = seq.StartDateTime.ToLocalTime();
-                    var gapDuration = seq.StartDateTime - currentPointer;
-                    summary.Gaps.Add(new GapRange { Start = gapStart, End = gapEnd });
-                    Console.WriteLine($"   - TRỐNG {gapDuration.TotalMinutes:F0} phút: {gapStart:dd/MM/yyyy HH:mm:ss} -> {gapEnd:dd/MM/yyyy HH:mm:ss}");
-                }
-                if (seq.EndDateTime > currentPointer)
-                    currentPointer = seq.EndDateTime;
+                    summary.Gaps.Add(new GapRange { Start = currentPointer.ToLocalTime(), End = seq.StartDateTime.ToLocalTime() });
+                if (seq.EndDateTime > currentPointer) currentPointer = seq.EndDateTime;
             }
 
             if ((endUtc - currentPointer).TotalMinutes > 5)
-            {
-                var gapStart = currentPointer.ToLocalTime();
-                var gapEnd = endUtc.ToLocalTime();
-                var gapDuration = endUtc - currentPointer;
-                summary.Gaps.Add(new GapRange { Start = gapStart, End = gapEnd });
-                Console.WriteLine($"   - TRỐNG {gapDuration.TotalMinutes:F0} phút: {gapStart:dd/MM/yyyy HH:mm:ss} -> {gapEnd:dd/MM/yyyy HH:mm:ss}");
-            }
-
-            if (!summary.Gaps.Any())
-                Console.WriteLine("   => Không phát hiện gap nào (ngưỡng > 5 phút).");
+                summary.Gaps.Add(new GapRange { Start = currentPointer.ToLocalTime(), End = endUtc.ToLocalTime() });
 
             return summary;
         }
 
-        static void PrintOverallSummary(System.Collections.Generic.List<CameraGapSummary> summaries)
+        static void PrintOverallSummary(List<CameraGapSummary> summaries)
         {
             var camerasWithGap = summaries.Where(s => s.Gaps.Any()).ToList();
-
             Console.WriteLine("\n=== SUMMARY ===");
             if (!camerasWithGap.Any())
             {
                 Console.WriteLine("Không phát hiện gap ở tất cả camera đã quét.");
                 return;
             }
-
             Console.WriteLine($"Phát hiện gap ở {camerasWithGap.Count}/{summaries.Count} camera:");
             foreach (var camera in camerasWithGap)
             {
